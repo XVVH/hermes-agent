@@ -334,14 +334,21 @@ def _resolve_home_dir() -> str:
     if expanded and expanded != "~":
         return expanded
 
-    try:
-        import pwd
+    # POSIX-only last resort: read the home dir from the password
+    # database. ``os.getuid`` does not exist on Windows; gate explicitly
+    # so the import-time footgun checker stays clean. (Windows already
+    # falls through to the ``USERPROFILE`` / ``HOMEDRIVE+HOMEPATH``
+    # branches above; if those failed there is no equivalent password
+    # database here, so just bail to ``/tmp``.)
+    if hasattr(os, "getuid"):
+        try:
+            import pwd
 
-        resolved = pwd.getpwuid(os.getuid()).pw_dir.strip()
-        if resolved:
-            return resolved
-    except Exception:
-        pass
+            resolved = pwd.getpwuid(os.getuid()).pw_dir.strip()  # windows-footgun: ok
+            if resolved:
+                return resolved
+        except Exception:
+            pass
 
     return "/tmp"
 
