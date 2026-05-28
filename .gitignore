@@ -118,3 +118,10 @@ scripts/out/
 /docs/cursor_sdk_strategy_notes.md
 /docs/plans/2026-05-25-cursor-provider-integration.md
 
+
+# Local-only bash shim that forces this fork's source to be used by the
+# system venv's hermes entrypoint. Convenient for in-place dev (./hermes
+# model, ./hermes --resume ...) but must NOT replace upstream's Python
+# launcher in the PR, since the launcher tests import it as Python.
+/hermes.dev-shim
+

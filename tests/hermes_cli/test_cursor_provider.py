@@ -351,8 +351,22 @@ class CursorPickerFlowTests(unittest.TestCase):
                 }
             return _post_install_status(provider_id)
 
+        # The pre-install status check is fully mocked above (it never
+        # touches ``shutil.which``), so the only path that needs an
+        # explicit ``shutil.which`` mock is the post-install resolver
+        # in ``resolve_external_process_provider_credentials`` and the
+        # ``provider_model_ids`` live-fetch. Both expect to find a
+        # ``cursor-agent`` binary on PATH after the installer ran.
+        # Some CI runners (and contributors' boxes without cursor-agent
+        # installed locally) need this explicit mock.
+        def which_side_effect(name, *args, **kwargs):
+            if name == "cursor-agent":
+                return "/fake/bin/cursor-agent"
+            return None
+
         with patch("hermes_cli.auth.get_external_process_provider_status",
                    side_effect=status_side_effect), \
+             patch("shutil.which", side_effect=which_side_effect), \
              patch("hermes_cli.main._prompt_cursor_install_choice",
                    return_value="install"), \
              patch("hermes_cli.main._run_cursor_agent_installer",
