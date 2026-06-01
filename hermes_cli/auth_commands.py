@@ -502,6 +502,10 @@ def auth_status_command(args) -> None:
     if not provider:
         raise SystemExit("Provider is required. Example: `hermes auth status spotify`.")
     status = auth_mod.get_auth_status(provider)
+    # Surface cursor auth conflict even when logged_in is True (API key sets it True).
+    conflict = status.get("conflict")
+    if conflict:
+        print(f"⚠  {conflict}")
     if not status.get("logged_in"):
         reason = status.get("error")
         if reason:
@@ -509,9 +513,8 @@ def auth_status_command(args) -> None:
         else:
             print(f"{provider}: logged out")
         return
-
     print(f"{provider}: logged in")
-    for key in ("auth_type", "client_id", "redirect_uri", "scope", "expires_at", "api_base_url"):
+    for key in ("auth_type", "client_id", "redirect_uri", "scope", "expires_at", "api_base_url", "email"):
         value = status.get(key)
         if value:
             print(f"  {key}: {value}")

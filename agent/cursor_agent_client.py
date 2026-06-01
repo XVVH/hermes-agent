@@ -102,6 +102,45 @@ _API_KEY_SENTINELS = frozenset({
     "external_process",
 })
 
+
+def _check_cursor_auth_conflict(command: str, api_key: str | None) -> str | None:
+    """Detect the CURSOR_API_KEY + active OAuth session conflict.
+
+    Returns a human-readable warning string when both auth paths are active
+    simultaneously, None otherwise.  Best-effort — never raises.
+
+    Root cause: cursor-agent sees both ``--api-key``/``CURSOR_API_KEY`` and
+    live OAuth tokens in the macOS Keychain, treats this as ambiguous, and
+    exits 1 with "Failed to reach the Cursor API" before reading stdin.
+    Fix: ``cursor-agent logout`` removes the OAuth tokens from the Keychain.
+    """
+    if not api_key:
+        return None
+    resolved = shutil.which(command) if command else None
+    if not resolved:
+        return None
+    try:
+        import subprocess as _sp
+
+        out = _sp.check_output(
+            [resolved, "status"],
+            text=True,
+            timeout=4,
+            stderr=_sp.DEVNULL,
+        ).strip()
+        for line in out.splitlines():
+            if line.strip().startswith("✓ Logged in as "):
+                email = line.strip().removeprefix("✓ Logged in as ").strip()
+                return (
+                    f"cursor-agent auth conflict: CURSOR_API_KEY is set but an active "
+                    f"OAuth session exists (logged in as {email!r}). "
+                    f"Every request will fail with 'Failed to reach the Cursor API'. "
+                    f"Fix: run `cursor-agent logout` then restart the Hermes gateway."
+                )
+    except Exception:
+        pass
+    return None
+
 # Reuse the tool-call extraction grammar from copilot_acp_client.  We do NOT
 # reuse its prompt builder — cursor's model is itself an agentic CLI with its
 # own built-in shell/edit/read tools, and the softer ACP wording ("ACP agent
@@ -1092,6 +1131,18 @@ class CursorAgentClient:
         # forward them to ``cursor-agent --api-key`` (which rejects them and
         # closes stdin, producing BrokenPipeError on our writes).
         self.api_key = None if candidate_key in _API_KEY_SENTINELS else candidate_key
+        # Eagerly check for the CURSOR_API_KEY + active-OAuth conflict.
+        # This fires before the first subprocess spawn — at that point the
+        # LLM is unreachable so no skill can load to surface the problem.
+        _conflict = _check_cursor_auth_conflict(
+            (command or _resolve_command()).strip() or DEFAULT_CURSOR_COMMAND,
+            self.api_key,
+        )
+        if _conflict:
+            import logging as _logging
+            import sys as _sys
+            _logging.getLogger(__name__).warning(_conflict)
+            print(f"\u26a0\ufe0f  {_conflict}", file=_sys.stderr, flush=True)
         self.base_url = base_url or CURSOR_MARKER_BASE_URL
         self._default_headers = dict(default_headers or {})
         self._command = (command or _resolve_command()).strip() or DEFAULT_CURSOR_COMMAND

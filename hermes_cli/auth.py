@@ -5724,10 +5724,22 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
             except Exception:
                 pass
 
+        api_key = os.getenv("CURSOR_API_KEY", "").strip()
         # CURSOR_API_KEY bypasses the login probe — if the user has set a
         # raw token they are effectively authenticated.
-        if not logged_in and os.getenv("CURSOR_API_KEY", "").strip():
+        if not logged_in and api_key:
             logged_in = True
+
+        # Detect the conflict: CURSOR_API_KEY set AND active OAuth session.
+        # cursor-agent treats this as ambiguous and fails every request.
+        conflict_warning: str | None = None
+        if api_key and logged_in_email:
+            conflict_warning = (
+                f"CURSOR_API_KEY is set but cursor-agent has an active OAuth session "
+                f"({logged_in_email!r}). Every request will fail with "
+                f"'Failed to reach the Cursor API'. "
+                f"Fix: `cursor-agent logout` then restart the Hermes gateway."
+            )
 
         return {
             "configured": bool(resolved_command),
@@ -5739,6 +5751,7 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
             "base_url": base_url,
             "logged_in": logged_in,
             "email": logged_in_email,
+            "conflict": conflict_warning,
         }
 
     command = (
