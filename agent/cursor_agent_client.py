@@ -3,6 +3,9 @@
 # Local additions on top of sudoingX base:
 #   - _check_cursor_auth_conflict() (2026-06-01): detects CURSOR_API_KEY + OAuth conflict
 #   - CursorAgentClient.__init__ conflict check + stderr warning (2026-06-01)
+#   - _clear_cursor_oauth_session() + post-spawn cleanup (2026-06-02): cursor-agent
+#     re-writes OAuth after every --api-key run; auto-clear prevents per-turn warnings
+#   - _CursorCallTiming + cursor-timing: logs (2026-06-02): spawn/dead-air/first-tool breakdown
 # On merge conflict: keep this file in full; upstream does not have cursor support.
 # Verify post-merge: grep -n '_check_cursor_auth_conflict\|XVVH CARRY' agent/cursor_agent_client.py
 
@@ -37,6 +40,7 @@ Design notes:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import queue
 import shlex
@@ -110,44 +114,194 @@ _API_KEY_SENTINELS = frozenset({
     "external_process",
 })
 
+_logger = logging.getLogger(__name__)
+
+
+def _cursor_timing_enabled() -> bool:
+    """Return False only when HERMES_CURSOR_TIMING is explicitly disabled."""
+    raw = os.getenv("HERMES_CURSOR_TIMING", "1").strip().lower()
+    return raw not in {"", "0", "false", "no", "off"}
+
+
+def _cursor_timing_verbose() -> bool:
+    raw = os.getenv("HERMES_CURSOR_TIMING_VERBOSE", "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+class _CursorCallTiming:
+    """Monotonic milestones for one cursor-agent subprocess invocation.
+
+    Emits one grep-friendly summary per call::
+
+        cursor-timing: model=... prompt_chars=... spawn_ms=... dead_air_ms=...
+
+    Set ``HERMES_CURSOR_TIMING=0`` to disable. Set ``HERMES_CURSOR_TIMING_VERBOSE=1``
+    for per-milestone lines as they fire.
+    """
+
+    __slots__ = ("model", "prompt_chars", "verbose", "_t0", "_marks")
+
+    def __init__(self, *, model: str, prompt_chars: int) -> None:
+        self.model = model
+        self.prompt_chars = prompt_chars
+        self.verbose = _cursor_timing_verbose()
+        self._t0 = time.monotonic()
+        self._marks: dict[str, float] = {"start": self._t0}
+
+    def mark(self, name: str) -> None:
+        if name in self._marks:
+            return
+        self._marks[name] = time.monotonic()
+        if self.verbose:
+            _logger.info(
+                "cursor-timing: +%.0fms %s",
+                (self._marks[name] - self._t0) * 1000,
+                name,
+            )
+
+    def ms(self, name: str) -> float | None:
+        t = self._marks.get(name)
+        if t is None:
+            return None
+        return (t - self._t0) * 1000
+
+    def delta_ms(self, end: str, start: str) -> float | None:
+        te = self._marks.get(end)
+        ts = self._marks.get(start)
+        if te is None or ts is None:
+            return None
+        return (te - ts) * 1000
+
+    def log_summary(self, accumulator: "_StreamJsonAccumulator") -> None:
+        if not _cursor_timing_enabled():
+            return
+        spawn = self.delta_ms("spawn", "run_start")
+        dead_air = self.delta_ms("first_json", "spawn")
+        stdin_ms = self.delta_ms("stdin_done", "spawn")
+        first_tool = self.ms("first_tool")
+        first_narrate = self.ms("first_narrate")
+        total = self.ms("done")
+        hermes_prep = self.delta_ms("run_start", "hermes_prep_start")
+        tool_count = len(accumulator.tool_events)
+        cursor_reported = accumulator.duration_ms
+        parts = [
+            f"model={self.model}",
+            f"prompt_chars={self.prompt_chars}",
+        ]
+        if hermes_prep is not None:
+            parts.append(f"hermes_prep_ms={hermes_prep:.0f}")
+        if spawn is not None:
+            parts.append(f"spawn_ms={spawn:.0f}")
+        if stdin_ms is not None:
+            parts.append(f"stdin_ms={stdin_ms:.0f}")
+        if dead_air is not None:
+            parts.append(f"dead_air_ms={dead_air:.0f}")
+        else:
+            parts.append("dead_air_ms=none")
+        if first_narrate is not None:
+            parts.append(f"first_narrate_ms={first_narrate:.0f}")
+        if first_tool is not None:
+            parts.append(f"first_tool_ms={first_tool:.0f}")
+        else:
+            parts.append("first_tool_ms=none")
+        parts.append(f"tools={tool_count}")
+        if total is not None:
+            parts.append(f"total_ms={total:.0f}")
+        if cursor_reported:
+            parts.append(f"cursor_duration_ms={cursor_reported}")
+        _logger.info("cursor-timing: %s", " ".join(parts))
+
+
+def _cursor_auto_clear_oauth_enabled() -> bool:
+    """When True (default), strip OAuth tokens in API-key mode.
+
+    cursor-agent re-writes OAuth to Keychain/cli-config after every
+    successful ``--api-key`` invocation.  Without cleanup the next
+    ``CursorAgentClient`` init sees dual auth and spams warnings even
+    though ``apiKeySource=flag`` makes the current request succeed.
+    """
+    raw = os.getenv("HERMES_CURSOR_CLEAR_OAUTH", "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _cursor_oauth_logged_in(command: str) -> str | None:
+    """Return the OAuth email if cursor-agent status shows a login, else None."""
+    resolved = shutil.which(command) if command else None
+    if not resolved:
+        return None
+    try:
+        out = subprocess.check_output(
+            [resolved, "status"],
+            text=True,
+            timeout=4,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        for line in out.splitlines():
+            if line.strip().startswith("✓ Logged in as "):
+                return line.strip().removeprefix("✓ Logged in as ").strip()
+    except Exception:
+        pass
+    return None
+
+
+def _clear_cursor_oauth_session(command: str) -> bool:
+    """Best-effort ``cursor-agent logout`` when OAuth is active.
+
+    Returns True when status is clear afterwards (or was already clear).
+    Never raises.
+    """
+    resolved = shutil.which(command) if command else None
+    if not resolved:
+        return False
+    email = _cursor_oauth_logged_in(command)
+    if email is None:
+        return True
+    try:
+        subprocess.run(
+            [resolved, "logout"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        return _cursor_oauth_logged_in(command) is None
+    except Exception:
+        return False
+
 
 def _check_cursor_auth_conflict(command: str, api_key: str | None) -> str | None:
     """Detect the CURSOR_API_KEY + active OAuth session conflict.
 
     Returns a human-readable warning string when both auth paths are active
-    simultaneously, None otherwise.  Best-effort — never raises.
+    simultaneously and could not be auto-cleared, None otherwise.
+    Best-effort — never raises.
 
-    Root cause: cursor-agent sees both ``--api-key``/``CURSOR_API_KEY`` and
-    live OAuth tokens in the macOS Keychain, treats this as ambiguous, and
-    exits 1 with "Failed to reach the Cursor API" before reading stdin.
-    Fix: ``cursor-agent logout`` removes the OAuth tokens from the Keychain.
+    cursor-agent with ``--api-key`` usually succeeds (``apiKeySource=flag``)
+    even when OAuth tokens linger from a prior run, but the CLI also
+    re-writes OAuth after each invocation — so manual ``cursor-agent logout``
+    does not stick across Hermes turns.  When ``HERMES_CURSOR_CLEAR_OAUTH`` is
+    enabled (default), we strip OAuth automatically in API-key mode.
     """
     if not api_key:
         return None
-    resolved = shutil.which(command) if command else None
-    if not resolved:
+    email = _cursor_oauth_logged_in(command)
+    if email is None:
         return None
-    try:
-        import subprocess as _sp
-
-        out = _sp.check_output(
-            [resolved, "status"],
-            text=True,
-            timeout=4,
-            stderr=_sp.DEVNULL,
-        ).strip()
-        for line in out.splitlines():
-            if line.strip().startswith("✓ Logged in as "):
-                email = line.strip().removeprefix("✓ Logged in as ").strip()
-                return (
-                    f"cursor-agent auth conflict: CURSOR_API_KEY is set but an active "
-                    f"OAuth session exists (logged in as {email!r}). "
-                    f"Every request will fail with 'Failed to reach the Cursor API'. "
-                    f"Fix: run `cursor-agent logout` then restart the Hermes gateway."
-                )
-    except Exception:
-        pass
-    return None
+    if _cursor_auto_clear_oauth_enabled():
+        if _clear_cursor_oauth_session(command):
+            _logger.debug(
+                "cleared cursor-agent OAuth session (%s) — API key mode",
+                email,
+            )
+            return None
+    return (
+        f"cursor-agent auth conflict: CURSOR_API_KEY is set but an active "
+        f"OAuth session exists (logged in as {email!r}). "
+        f"Requests may still succeed via --api-key, but cursor-agent re-writes "
+        f"OAuth after each run so this repeats every turn. "
+        f"Fix: run `cursor-agent logout`, or leave HERMES_CURSOR_CLEAR_OAUTH=1 "
+        f"(default) to auto-clear."
+    )
 
 # Reuse the tool-call extraction grammar from copilot_acp_client.  We do NOT
 # reuse its prompt builder — cursor's model is itself an agentic CLI with its
@@ -597,8 +751,14 @@ class _StreamJsonAccumulator:
     and surface text. The instance is reusable per-call but not thread-safe.
     """
 
-    def __init__(self, on_tool_event: Any = None, on_text_event: Any = None) -> None:
+    def __init__(
+        self,
+        on_tool_event: Any = None,
+        on_text_event: Any = None,
+        timing: _CursorCallTiming | None = None,
+    ) -> None:
         self.text_parts: list[str] = []
+        self._timing = timing
         self.reasoning_parts: list[str] = []
         self.session_id: str = ""
         self.request_id: str = ""
@@ -657,6 +817,8 @@ class _StreamJsonAccumulator:
             return
 
         if evt_type == "thinking":
+            if self._timing is not None:
+                self._timing.mark("first_thinking")
             text = event.get("text")
             if isinstance(text, str) and text:
                 self.reasoning_parts.append(text)
@@ -673,6 +835,8 @@ class _StreamJsonAccumulator:
                         if block.get("type") == "text":
                             text = block.get("text")
                             if isinstance(text, str) and text:
+                                if self._timing is not None:
+                                    self._timing.mark("first_text")
                                 self.text_parts.append(text)
                                 self.event_log.append(("text", text))
                                 # Defer the narrate dispatch — see
@@ -699,6 +863,8 @@ class _StreamJsonAccumulator:
             return
 
         if evt_type == "result":
+            if self._timing is not None:
+                self._timing.mark("terminal")
             self.terminal = True
             self.is_error = bool(event.get("is_error", False))
             subtype = event.get("subtype")
@@ -756,6 +922,8 @@ class _StreamJsonAccumulator:
             args_obj = {}
 
         if subtype == "started":
+            if self._timing is not None:
+                self._timing.mark("first_tool")
             evt = _CursorToolEvent(
                 call_id=call_id,
                 envelope_key=envelope_key,
@@ -818,6 +986,8 @@ class _StreamJsonAccumulator:
         Errors are swallowed — a broken callback must never abort the
         chat call.
         """
+        if self._timing is not None:
+            self._timing.mark("first_narrate")
         if self._on_text_event is None:
             return
         try:
@@ -1269,6 +1439,15 @@ class CursorAgentClient:
         # turn (raw); neither matches what's in the next-turn prompt.
         # Estimating from messages keeps the bar consistent before,
         # during, and after the call (#cursor-bar-stable).
+        chosen_model = (model or DEFAULT_CURSOR_MODEL).strip() or DEFAULT_CURSOR_MODEL
+        timing: _CursorCallTiming | None = None
+        if _cursor_timing_enabled():
+            timing = _CursorCallTiming(
+                model=chosen_model,
+                prompt_chars=0,  # filled after prompt build
+            )
+            timing.mark("hermes_prep_start")
+
         # Detect a NEW user turn: Hermes adds a user message at the top
         # of every fresh prompt cycle, then loops internally on tool_calls
         # without adding more user messages. So a strictly increased user-
@@ -1329,6 +1508,8 @@ class CursorAgentClient:
             tools=tools,
             tool_choice=tool_choice,
         )
+        if timing is not None:
+            timing.prompt_chars = len(prompt_text)
 
         if timeout is None:
             effective_timeout = self._timeout_seconds
@@ -1342,13 +1523,14 @@ class CursorAgentClient:
             numeric = [float(v) for v in candidates if isinstance(v, (int, float))]
             effective_timeout = max(numeric) if numeric else self._timeout_seconds
 
-        chosen_model = (model or DEFAULT_CURSOR_MODEL).strip() or DEFAULT_CURSOR_MODEL
-
         accumulator = self._run_prompt(
             prompt_text=prompt_text,
             model=chosen_model,
             timeout_seconds=effective_timeout,
+            timing=timing,
         )
+        if timing is not None:
+            timing.log_summary(accumulator)
 
         # Use the synthesis text (post-last-tool) so the user gets the
         # actual answer without the wall of "let me check X next" prose
@@ -1476,7 +1658,10 @@ class CursorAgentClient:
         prompt_text: str,
         model: str,
         timeout_seconds: float,
+        timing: _CursorCallTiming | None = None,
     ) -> _StreamJsonAccumulator:
+        if timing is not None:
+            timing.mark("run_start")
         workspace, _ephemeral = self._allocate_workspace()
         argv = self._build_argv(model=model, workspace=workspace)
 
@@ -1501,6 +1686,9 @@ class CursorAgentClient:
         if proc.stdin is None or proc.stdout is None:
             proc.kill()
             raise RuntimeError("cursor-agent process did not expose stdin/stdout pipes.")
+
+        if timing is not None:
+            timing.mark("spawn")
 
         self.is_closed = False
         with self._active_process_lock:
@@ -1539,6 +1727,8 @@ class CursorAgentClient:
                     proc.stdin.close()
                 except Exception:
                     pass
+            if timing is not None:
+                timing.mark("stdin_done")
 
             if stdin_error is not None:
                 # Give the child a moment to flush its error message, then bail.
@@ -1568,6 +1758,8 @@ class CursorAgentClient:
                     line = line.strip()
                     if not line:
                         continue
+                    if timing is not None:
+                        timing.mark("first_stdout_line")
                     try:
                         inbox.put(json.loads(line))
                     except Exception:
@@ -1583,6 +1775,7 @@ class CursorAgentClient:
             accumulator = _StreamJsonAccumulator(
                 on_tool_event=self._build_tool_event_bridge(),
                 on_text_event=self._build_text_event_bridge(),
+                timing=timing,
             )
             # Idle deadline, not wall-clock. Resets on every successful
             # stream-json event. A turn can run arbitrarily long in total
@@ -1606,6 +1799,8 @@ class CursorAgentClient:
                     event = inbox.get(timeout=0.25)
                 except queue.Empty:
                     continue
+                if timing is not None:
+                    timing.mark("first_json")
                 # Successful event arrival => subprocess is alive and
                 # making progress. Reset the idle deadline.
                 deadline = time.monotonic() + idle_seconds
@@ -1625,9 +1820,15 @@ class CursorAgentClient:
                     + (f"stderr tail:\n{redacted}" if redacted else "(no stderr)")
                 )
 
+            if timing is not None:
+                timing.mark("done")
             return accumulator
         finally:
             self._terminate_active_proc(proc)
+            # cursor-agent re-authenticates OAuth after every --api-key run;
+            # clear it so the next turn's init check stays quiet.
+            if self.api_key and _cursor_auto_clear_oauth_enabled():
+                _clear_cursor_oauth_session(self._command)
 
     def _estimate_per_round_context(self, accumulator: "_StreamJsonAccumulator") -> int:
         """Compute cursor's per-round context estimate without mutating it.
