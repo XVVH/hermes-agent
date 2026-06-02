@@ -5730,8 +5730,11 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
         if not logged_in and api_key:
             logged_in = True
 
-        # Detect the conflict: CURSOR_API_KEY set AND active OAuth session.
-        # cursor-agent treats this as ambiguous and fails every request.
+        # XVVH CARRY-FORWARD (2026-06-01): detect CURSOR_API_KEY + OAuth conflict.
+        # cursor-agent fails when both are present. Surface via 'conflict' key so
+        # auth_commands.py and gateway startup can warn before the first spawn.
+        # On upstream merge: re-apply this block if get_external_process_auth_status()
+        # is modified; check that 'conflict' key is still in the returned dict.
         conflict_warning: str | None = None
         if api_key and logged_in_email:
             conflict_warning = (

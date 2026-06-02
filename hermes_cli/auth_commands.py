@@ -502,6 +502,8 @@ def auth_status_command(args) -> None:
     if not provider:
         raise SystemExit("Provider is required. Example: `hermes auth status spotify`.")
     status = auth_mod.get_auth_status(provider)
+    # XVVH CARRY-FORWARD (2026-06-01): surface cursor auth conflict warning.
+    # On upstream merge: re-apply if auth_status_command() is modified.
     # Surface cursor auth conflict even when logged_in is True (API key sets it True).
     conflict = status.get("conflict")
     if conflict:

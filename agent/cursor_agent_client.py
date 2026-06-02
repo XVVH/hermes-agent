@@ -1,3 +1,11 @@
+# XVVH CARRY-FORWARD: This entire file is not in NousResearch upstream.
+# Originally merged from sudoingX/hermes-agent. Preserve on every upstream merge.
+# Local additions on top of sudoingX base:
+#   - _check_cursor_auth_conflict() (2026-06-01): detects CURSOR_API_KEY + OAuth conflict
+#   - CursorAgentClient.__init__ conflict check + stderr warning (2026-06-01)
+# On merge conflict: keep this file in full; upstream does not have cursor support.
+# Verify post-merge: grep -n '_check_cursor_auth_conflict\|XVVH CARRY' agent/cursor_agent_client.py
+
 """OpenAI-compatible facade that forwards Hermes requests to ``cursor-agent``.
 
 This adapter lets Hermes treat the Cursor Agent CLI as a chat-style backend so
