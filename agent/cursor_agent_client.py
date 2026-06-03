@@ -128,6 +128,14 @@ def _cursor_timing_verbose() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _cursor_timing_tools() -> bool:
+    """Emit per-tool duration lines after the summary (verbose also enables this)."""
+    if _cursor_timing_verbose():
+        return True
+    raw = os.getenv("HERMES_CURSOR_TIMING_TOOLS", "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 class _CursorCallTiming:
     """Monotonic milestones for one cursor-agent subprocess invocation.
 
@@ -210,6 +218,24 @@ class _CursorCallTiming:
         if cursor_reported:
             parts.append(f"cursor_duration_ms={cursor_reported}")
         _logger.info("cursor-timing: %s", " ".join(parts))
+        if _cursor_timing_tools() and accumulator.tool_events:
+            self._log_tool_breakdown(accumulator)
+
+    def _log_tool_breakdown(self, accumulator: "_StreamJsonAccumulator") -> None:
+        """One line per internal cursor tool call (name, duration, preview)."""
+        for i, evt in enumerate(accumulator.tool_events, start=1):
+            preview = _build_cursor_tool_preview(evt)
+            if len(preview) > 120:
+                preview = preview[:117] + "..."
+            err = " error" if evt.is_error else ""
+            _logger.info(
+                "cursor-timing-tool: #%d %s %dms%s%s",
+                i,
+                evt.name,
+                evt.duration_ms,
+                err,
+                f" {preview!r}" if preview else "",
+            )
 
 
 def _cursor_auto_clear_oauth_enabled() -> bool:
