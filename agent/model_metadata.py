@@ -277,6 +277,23 @@ _GROK_EFFORT_CAPABLE_PREFIXES = (
 )
 
 
+def grok_misroutes_client_web_search(model: str) -> bool:
+    """True when xAI must not receive a client function named ``web_search``.
+
+    On grok-composer*, declaring ``function: web_search`` triggers a stuck
+    server-side ``web_search_call`` → ``finish_reason=incomplete``. Other
+    probed xAI models accept client ``web_search`` and should keep PR-1
+    native inject instead.
+    """
+    name = (model or "").strip().lower()
+    if not name:
+        return False
+    for sep in ("/",):
+        if sep in name:
+            name = name.rsplit(sep, 1)[-1]
+    return "grok-composer" in name
+
+
 def grok_supports_reasoning_effort(model: str) -> bool:
     """Return True when an xAI Grok model accepts ``reasoning.effort``.
 

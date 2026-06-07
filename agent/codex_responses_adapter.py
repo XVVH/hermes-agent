@@ -274,6 +274,27 @@ _RESPONSES_BUILTIN_TOOL_TYPES = {
     "local_shell",
 }
 
+# xAI composer wire alias: registry/handler stays ``web_search``; outbound
+# Responses ``function`` name on grok-composer* is ``web_search_client``.
+XAI_WEB_SEARCH_REGISTRY_NAME = "web_search"
+XAI_WEB_SEARCH_WIRE_NAME = "web_search_client"
+
+
+def _map_registry_tool_to_xai_wire(name: str, model: Optional[str]) -> str:
+    if name != XAI_WEB_SEARCH_REGISTRY_NAME or not model:
+        return name
+    from agent.model_metadata import grok_misroutes_client_web_search
+
+    if grok_misroutes_client_web_search(model):
+        return XAI_WEB_SEARCH_WIRE_NAME
+    return name
+
+
+def _map_xai_wire_to_registry(name: str) -> str:
+    if name == XAI_WEB_SEARCH_WIRE_NAME:
+        return XAI_WEB_SEARCH_REGISTRY_NAME
+    return name
+
 
 # ---------------------------------------------------------------------------
 # Message format conversion
@@ -299,6 +320,7 @@ def _normalize_responses_message_status(value: Any, *, default: str = "completed
 def _chat_messages_to_responses_input(
     messages: List[Dict[str, Any]],
     *,
+    model: Optional[str] = None,
     is_xai_responses: bool = False,
     replay_encrypted_reasoning: bool = True,
     current_issuer_kind: Optional[str] = None,
@@ -487,6 +509,7 @@ def _chat_messages_to_responses_input(
                         fn_name = fn.get("name")
                         if not isinstance(fn_name, str) or not fn_name.strip():
                             continue
+                        fn_name = _map_registry_tool_to_xai_wire(fn_name.strip(), model)
 
                         embedded_call_id, embedded_response_item_id = _split_responses_tool_id(
                             tc.get("id")
@@ -1218,6 +1241,7 @@ def _normalize_codex_response(
             if item_status in {"queued", "in_progress", "incomplete"}:
                 continue
             fn_name = getattr(item, "name", "") or ""
+            fn_name = _map_xai_wire_to_registry(fn_name)
             arguments = getattr(item, "arguments", "{}")
             if not isinstance(arguments, str):
                 arguments = json.dumps(arguments, ensure_ascii=False)

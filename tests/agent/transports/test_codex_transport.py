@@ -205,13 +205,10 @@ class TestCodexBuildKwargs:
         assert "reasoning.encrypted_content" in kw.get("include", [])
 
     def test_xai_injects_native_web_search_tool(self, transport):
-        """xAI path declares xAI's native server-side web_search built-in so
-        grok server-side search runs to completion (otherwise the turn stalls
-        as reasoning-with-no-answer -> false 'incomplete' -> 3 retries -> fail).
-        """
+        """Non-composer xAI declares native server-side web_search built-in."""
         messages = [{"role": "user", "content": "Find current prices."}]
         kw = transport.build_kwargs(
-            model="grok-composer-2.5-fast", messages=messages,
+            model="grok-4.3", messages=messages,
             tools=[{"type": "function", "function": {
                 "name": "read_file", "description": "Read a file.",
                 "parameters": {"type": "object",
@@ -220,17 +217,32 @@ class TestCodexBuildKwargs:
         )
         tool_types = [t.get("type") for t in kw.get("tools", [])]
         assert "web_search" in tool_types, kw.get("tools")
-        # Non-conflicting client-side tools are preserved.
         names = [t.get("name") for t in kw.get("tools", []) if t.get("type") == "function"]
         assert "read_file" in names
 
-    def test_xai_drops_clientside_web_search_to_avoid_duplicate(self, transport):
-        """When the client registers its own 'web_search' function, the xAI
-        path must drop it and rely on the native built-in — otherwise xAI
-        returns HTTP 400 'Duplicate tool names: web_search'."""
-        messages = [{"role": "user", "content": "Search the web."}]
+    def test_xai_composer_renames_web_search_to_wire_alias(self, transport):
+        """grok-composer keeps client search on the wire as web_search_client."""
+        messages = [{"role": "user", "content": "Search."}]
         kw = transport.build_kwargs(
             model="grok-composer-2.5-fast", messages=messages,
+            tools=[{"type": "function", "function": {
+                "name": "web_search", "description": "Search the web.",
+                "parameters": {"type": "object",
+                               "properties": {"query": {"type": "string"}}}}}],
+            is_xai_responses=True,
+        )
+        tools = kw.get("tools", [])
+        assert not any(t.get("type") == "web_search" for t in tools)
+        assert any(
+            t.get("type") == "function" and t.get("name") == "web_search_client"
+            for t in tools
+        )
+
+    def test_xai_drops_clientside_web_search_to_avoid_duplicate(self, transport):
+        """Non-composer xAI drops client web_search and uses native built-in."""
+        messages = [{"role": "user", "content": "Search the web."}]
+        kw = transport.build_kwargs(
+            model="grok-4.3", messages=messages,
             tools=[{"type": "function", "function": {
                 "name": "web_search", "description": "Search the web.",
                 "parameters": {"type": "object",

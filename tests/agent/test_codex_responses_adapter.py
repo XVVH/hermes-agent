@@ -3,10 +3,13 @@ from types import SimpleNamespace
 import pytest
 
 from agent.codex_responses_adapter import (
+    XAI_WEB_SEARCH_WIRE_NAME,
+    _chat_messages_to_responses_input,
     _format_responses_error,
     _normalize_codex_response,
     _preflight_codex_api_kwargs,
 )
+from agent.model_metadata import grok_misroutes_client_web_search
 
 
 def test_normalize_codex_response_drops_transient_rs_tmp_reasoning_items():
@@ -284,3 +287,71 @@ def test_normalize_codex_response_failed_with_message_only():
     )
     with pytest.raises(RuntimeError, match=r"^model error$"):
         _normalize_codex_response(response)
+
+
+def test_grok_misroutes_client_web_search_predicate():
+    assert grok_misroutes_client_web_search("grok-composer-2.5-fast")
+    assert grok_misroutes_client_web_search("x-ai/grok-composer-2.5-fast")
+    assert not grok_misroutes_client_web_search("grok-4.3")
+
+
+def test_normalize_codex_response_maps_web_search_client_to_registry():
+    response = SimpleNamespace(
+        status="completed",
+        output=[
+            SimpleNamespace(
+                type="function_call",
+                name="web_search_client",
+                arguments='{"query": "test"}',
+                call_id="call_abc",
+                status="completed",
+            ),
+        ],
+    )
+    assistant_message, finish_reason = _normalize_codex_response(response)
+    assert finish_reason == "tool_calls"
+    assert len(assistant_message.tool_calls) == 1
+    assert assistant_message.tool_calls[0].function.name == "web_search"
+
+
+def test_chat_messages_replay_renames_web_search_for_composer():
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "web_search", "arguments": '{"query": "x"}'},
+                }
+            ],
+        },
+    ]
+    items = _chat_messages_to_responses_input(
+        messages, model="grok-composer-2.5-fast", is_xai_responses=True,
+    )
+    fc = [it for it in items if it.get("type") == "function_call"]
+    assert len(fc) == 1
+    assert fc[0]["name"] == XAI_WEB_SEARCH_WIRE_NAME
+
+
+def test_chat_messages_replay_keeps_web_search_name_for_grok_43():
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "web_search", "arguments": "{}"},
+                }
+            ],
+        },
+    ]
+    items = _chat_messages_to_responses_input(
+        messages, model="grok-4.3", is_xai_responses=True,
+    )
+    fc = [it for it in items if it.get("type") == "function_call"]
+    assert fc[0]["name"] == "web_search"

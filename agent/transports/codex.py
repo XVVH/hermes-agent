@@ -45,6 +45,7 @@ class ResponsesApiTransport(ProviderTransport):
         self._last_issuer_kind = issuer
         return _chat_messages_to_responses_input(
             messages,
+            model=kwargs.get("model"),
             is_xai_responses=bool(kwargs.get("is_xai_responses")),
             replay_encrypted_reasoning=bool(
                 kwargs.get("replay_encrypted_reasoning", True)
@@ -84,6 +85,8 @@ class ResponsesApiTransport(ProviderTransport):
             github_reasoning_extra: dict | None — Copilot reasoning params
         """
         from agent.codex_responses_adapter import (
+            XAI_WEB_SEARCH_REGISTRY_NAME,
+            XAI_WEB_SEARCH_WIRE_NAME,
             _chat_messages_to_responses_input,
             _responses_tools,
         )
@@ -129,47 +132,32 @@ class ResponsesApiTransport(ProviderTransport):
 
         response_tools = _responses_tools(tools)
 
-        # xAI server-side web search.
+        # xAI server-side web search (non-composer) vs composer wire alias.
         #
-        # grok models on xAI's /v1/responses surface (notably
-        # grok-composer-2.5-fast on SuperGrok OAuth) have a *native*,
-        # server-executed web search.  When the model is handed a
-        # client-side function literally named ``web_search``, it routes
-        # the intent to that native engine — but because the tool is
-        # declared as a plain ``function`` rather than xAI's first-class
-        # ``{"type": "web_search"}`` built-in, the server-side search is
-        # dispatched but never reconciled: the response streams reasoning
-        # + ``web_search_call`` progress items, the searches never reach
-        # ``status="completed"`` in the assembled output, no final
-        # message is emitted, and ``_normalize_codex_response`` correctly
-        # sees reasoning-with-no-answer and reports ``incomplete``.  The
-        # turn then burns 3 continuation retries and fails with "Codex
-        # response remained incomplete after 3 continuation attempts".
-        # Verified live against grok-composer-2.5-fast (2026-06).
-        #
-        # Fix: declare xAI's native ``web_search`` built-in so the search
-        # actually runs to completion server-side and the model streams a
-        # real answer.  The Responses API rejects two tools sharing the
-        # name ``web_search`` (HTTP 400 "Duplicate tool names"), so we
-        # drop the client-side ``web_search`` function for the xAI path
-        # and let the native tool satisfy it.  All other client-side
-        # tools (read_file, terminal, web_extract, MCP tools, …) are
-        # untouched and continue to dispatch through Hermes's agent loop.
-        #
-        # NOTE: this routes ``web_search`` to Grok's native search engine
-        # for xAI sessions instead of Hermes's configured web provider
-        # (Tavily/etc.), and those results bypass Hermes's tool-trace /
-        # citation plumbing (they arrive baked into the model's answer
-        # rather than as a tool result the loop observes).  Scoped to
-        # ``is_xai_responses`` deliberately; narrow to specific models if
-        # a future grok variant should keep the client-side function.
+        # grok-composer* misroutes client ``function: web_search`` to a stuck
+        # server-side ``web_search_call`` → incomplete loop. Fix: declare
+        # ``function: web_search_client`` and run Hermes ``web_search`` in the
+        # agent loop (PR 2). Other xAI models accept client ``web_search``;
+        # keep PR-1 native ``{"type": "web_search"}`` built-in for them.
         if is_xai_responses:
-            filtered = [
-                t for t in (response_tools or [])
-                if not (isinstance(t, dict) and t.get("name") == "web_search")
-            ]
-            filtered.append({"type": "web_search"})
-            response_tools = filtered
+            from agent.model_metadata import grok_misroutes_client_web_search
+
+            if grok_misroutes_client_web_search(model):
+                if response_tools:
+                    for t in response_tools:
+                        if (
+                            isinstance(t, dict)
+                            and t.get("type") == "function"
+                            and t.get("name") == XAI_WEB_SEARCH_REGISTRY_NAME
+                        ):
+                            t["name"] = XAI_WEB_SEARCH_WIRE_NAME
+            else:
+                filtered = [
+                    t for t in (response_tools or [])
+                    if not (isinstance(t, dict) and t.get("name") == "web_search")
+                ]
+                filtered.append({"type": "web_search"})
+                response_tools = filtered
 
         # ``tools`` MUST be omitted entirely when there are no functions to
         # expose: the openai SDK's ``responses.stream()`` / ``responses.parse()``
@@ -184,6 +172,7 @@ class ResponsesApiTransport(ProviderTransport):
             "instructions": instructions,
             "input": _chat_messages_to_responses_input(
                 payload_messages,
+                model=model,
                 is_xai_responses=is_xai_responses,
                 replay_encrypted_reasoning=replay_encrypted_reasoning,
                 current_issuer_kind=issuer_kind,

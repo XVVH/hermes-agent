@@ -1791,6 +1791,17 @@ def repair_tool_call(agent, tool_name: str) -> str | None:
     if not tool_name:
         return None
 
+    from agent.codex_responses_adapter import (
+        XAI_WEB_SEARCH_REGISTRY_NAME,
+        XAI_WEB_SEARCH_WIRE_NAME,
+    )
+
+    if (
+        tool_name == XAI_WEB_SEARCH_WIRE_NAME
+        and XAI_WEB_SEARCH_REGISTRY_NAME in agent.valid_tool_names
+    ):
+        return XAI_WEB_SEARCH_REGISTRY_NAME
+
     def _norm(s: str) -> str:
         return s.lower().replace("-", "_").replace(" ", "_")
 

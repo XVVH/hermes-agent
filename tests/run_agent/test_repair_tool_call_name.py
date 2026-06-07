@@ -54,6 +54,9 @@ class TestExistingBehaviorStillWorks:
     def test_dash_to_underscore(self, repair):
         assert repair("web-search") == "web_search"
 
+    def test_xai_composer_wire_alias(self, repair):
+        assert repair("web_search_client") == "web_search"
+
     def test_space_to_underscore(self, repair):
         assert repair("write file") == "write_file"
 
